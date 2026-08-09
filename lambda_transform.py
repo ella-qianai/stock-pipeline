@@ -1,47 +1,101 @@
 import boto3
 import json
-import os
+import logging
 import psycopg2
-from datetime import datetime, timezone
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 secrets_client = boto3.client("secretsmanager")
 s3_client = boto3.client("s3")
 
 DB_SECRET_NAME = "stock-pipeline/db-credentials"
 
+# The fields Alpha Vantage is expected to return for each daily bar. Checked
+# explicitly on every record so a silent upstream schema change (a renamed
+# or missing field) shows up as a clear log line instead of a raw KeyError
+# three functions away from where it actually happened.
+REQUIRED_PRICE_FIELDS = [
+    "1. open", "2. high", "3. low", "4. close", "5. volume",
+]
+
 
 def get_db_credentials():
-    """from Secrets Manager load database connection information"""
+    """Load RDS connection info from Secrets Manager."""
     response = secrets_client.get_secret_value(SecretId=DB_SECRET_NAME)
     return json.loads(response["SecretString"])
 
 
 def get_db_connection(creds):
-    """establish RDS PostgreSQL connection"""
+    """Open an RDS PostgreSQL connection."""
     return psycopg2.connect(
         host=creds["host"],
         database=creds["database"],
         user=creds["username"],
         password=creds["password"],
         port=creds["port"],
-        connect_timeout=10
+        connect_timeout=10,
     )
 
 
 def read_from_s3(bucket, key):
-    """read original JSON file from S3"""
+    """Read one raw JSON payload from the S3 Bronze layer."""
     response = s3_client.get_object(Bucket=bucket, Key=key)
     return json.loads(response["Body"].read().decode("utf-8"))
 
 
 def get_latest_price(time_series):
-    """extract latest day data from time series"""
+    """Pick the most recent trading day out of the time series payload."""
     latest_date = sorted(time_series.keys())[-1]
     return latest_date, time_series[latest_date]
 
 
-def upsert_stock_price(cursor, symbol, price_date, price_data):
-    """write stock price data to fact_stock_prices table (update if exists, insert if not)"""
+class DataQualityError(Exception):
+    """Raised when a single day's price record fails validation, so it can
+    be skipped and logged without aborting the rest of the batch."""
+
+
+def validate_price_data(symbol, price_date, price_data):
+    """Schema and sanity checks run on every record before it's written.
+
+    Two different failure modes are checked for on purpose:
+    - schema drift: a field Alpha Vantage used to send is missing or renamed
+    - bad values: fields are present but nonsensical (negative price,
+      high below low), which a schema check alone would miss
+    """
+    missing = [f for f in REQUIRED_PRICE_FIELDS if f not in price_data]
+    if missing:
+        raise DataQualityError(
+            f"{symbol} {price_date}: missing fields {missing} — possible upstream schema change"
+        )
+
+    try:
+        open_p = float(price_data["1. open"])
+        high_p = float(price_data["2. high"])
+        low_p = float(price_data["3. low"])
+        close_p = float(price_data["4. close"])
+        volume = int(price_data["5. volume"])
+    except (TypeError, ValueError) as e:
+        raise DataQualityError(f"{symbol} {price_date}: non-numeric field value ({e})")
+
+    if min(open_p, high_p, low_p, close_p) <= 0:
+        raise DataQualityError(f"{symbol} {price_date}: non-positive price found")
+    if high_p < low_p:
+        raise DataQualityError(f"{symbol} {price_date}: high ({high_p}) < low ({low_p})")
+    if volume < 0:
+        raise DataQualityError(f"{symbol} {price_date}: negative volume ({volume})")
+
+    return {
+        "open_price": open_p,
+        "high_price": high_p,
+        "low_price": low_p,
+        "close_price": close_p,
+        "volume": volume,
+    }
+
+
+def upsert_stock_price(cursor, symbol, price_date, clean):
+    """Write one validated price record (idempotent — safe to re-run)."""
     sql = """
         INSERT INTO fact_stock_prices
             (symbol, price_date, open_price, high_price, low_price, close_price, volume)
@@ -56,60 +110,68 @@ def upsert_stock_price(cursor, symbol, price_date, price_data):
             volume      = EXCLUDED.volume
     """
     cursor.execute(sql, (
-        symbol,
-        price_date,
-        float(price_data["1. open"]),
-        float(price_data["2. high"]),
-        float(price_data["3. low"]),
-        float(price_data["4. close"]),
-        int(price_data["5. volume"])
+        symbol, price_date,
+        clean["open_price"], clean["high_price"], clean["low_price"],
+        clean["close_price"], clean["volume"],
     ))
 
 
-def lambda_handler(event, context):
+def process_record(cursor, bucket, key):
+    """Handle one S3 object end to end: read, validate, upsert.
+
+    Raises DataQualityError / KeyError for the caller to catch, so one bad
+    file in a batch of five doesn't roll back the four good ones.
     """
-    Triggered by S3 upload event, event contains bucket name and file path
+    symbol = key.split("/")[-1].replace(".json", "")
+    raw_data = read_from_s3(bucket, key)
+
+    if "Time Series (Daily)" not in raw_data:
+        raise DataQualityError(f"{symbol}: no 'Time Series (Daily)' key in raw payload")
+
+    time_series = raw_data["Time Series (Daily)"]
+    price_date, price_data = get_latest_price(time_series)
+    clean = validate_price_data(symbol, price_date, price_data)
+    upsert_stock_price(cursor, symbol, price_date, clean)
+    return f"{symbol} - {price_date}"
+
+
+def lambda_handler(event, context):
+    """Triggered by an S3 ObjectCreated event under bronze/.
+
+    Each record in the batch is committed independently: if one symbol's
+    file is malformed, it's logged and skipped, and the rest of the batch
+    still lands in RDS. The old version wrapped the whole loop in a single
+    transaction, so one bad record silently discarded every good one in
+    the same run.
     """
     creds = get_db_credentials()
     conn = get_db_connection(creds)
     cursor = conn.cursor()
     processed = []
+    skipped = []
 
     try:
         for record in event["Records"]:
             bucket = record["s3"]["bucket"]["name"]
             key = record["s3"]["object"]["key"]
-
-            # extract stock code from file path (e.g. bronze/stock_prices/2026-04-12/AAPL.json)
-            symbol = key.split("/")[-1].replace(".json", "")
-            print(f"Processing {symbol} from s3://{bucket}/{key}")
-
-            raw_data = read_from_s3(bucket, key)
-
-            if "Time Series (Daily)" not in raw_data:
-                print(f"Warning: No time series data for {symbol}, skipping")
-                continue
-
-            time_series = raw_data["Time Series (Daily)"]
-            price_date, price_data = get_latest_price(time_series)
-
-            upsert_stock_price(cursor, symbol, price_date, price_data)
-            processed.append(f"{symbol} - {price_date}")
-            print(f"Inserted {symbol} price for {price_date}")
-
-        conn.commit()
-        print(f"Done. Processed: {processed}")
-
-    except Exception as e:
-        conn.rollback()
-        print(f"Error: {e}")
-        raise e
-
+            try:
+                result = process_record(cursor, bucket, key)
+                conn.commit()
+                processed.append(result)
+                logger.info("Processed %s", result)
+            except (DataQualityError, KeyError) as e:
+                conn.rollback()
+                skipped.append(str(e))
+                logger.warning("Skipping %s: %s", key, e)
     finally:
         cursor.close()
         conn.close()
 
+    logger.info("Done. processed=%d skipped=%d", len(processed), len(skipped))
+    if skipped:
+        logger.warning("Skipped records: %s", skipped)
+
     return {
         "statusCode": 200,
-        "body": json.dumps({"processed": processed})
+        "body": json.dumps({"processed": processed, "skipped": skipped}),
     }

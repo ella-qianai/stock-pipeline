@@ -1,48 +1,80 @@
 # Stock Market ETL Pipeline on AWS
 
-A fully automated data pipeline that ingests daily stock price data from the Alpha Vantage API, stores raw data in S3, transforms it, and loads it into a PostgreSQL database on AWS RDS.
+![tests](https://github.com/ella-qianai/stock-pipeline/actions/workflows/tests.yml/badge.svg)
+
+A fully automated, scheduled ETL pipeline: it calls a third-party REST API daily, stages the raw response in S3, validates and transforms it, and loads it into a PostgreSQL data warehouse — with retry logic, per-record failure isolation, and a standalone data-quality check on top.
+
+It's a small pipeline (5 stocks, one API), but every piece is built the way a larger one would need to be: nothing silently swallows a bad record, nothing assumes the upstream API will always behave, and every failure mode has a specific, readable log line instead of a stack trace.
 
 ---
 
 ## Architecture
 
 ```
-EventBridge (daily 5PM ET)
+EventBridge (daily 5PM ET, cron)
         ↓
 Lambda ① — Ingest
-  Fetches stock prices from Alpha Vantage API
-  Stores raw JSON to S3 Bronze layer
+  GET request to the Alpha Vantage REST API (JSON, API-key auth)
+  Retries transient failures with exponential backoff
+  Distinguishes "rate-limited" from "no data" from "bad response"
+  Stores raw JSON to S3 Bronze layer, unmodified
         ↓
 S3 Upload Event (automatic trigger)
         ↓
 Lambda ② — Transform & Load
   Reads raw JSON from S3
-  Cleans and transforms data
-  Loads into RDS PostgreSQL
+  Validates schema (required fields) and sanity (price/volume ranges)
+  Skips and logs a bad record instead of failing the whole batch
+  Upserts into RDS PostgreSQL (idempotent — safe to re-run)
         ↓
 RDS PostgreSQL
   dim_stocks        — company reference data
   fact_stock_prices — daily price records
+        ↓
+data_quality_check.py — run after the daily load
+  Freshness: did every tracked symbol load today?
+  Completeness: any symbol gone unexpectedly sparse this week?
+  Sanity: does anything in the table itself look wrong?
 
 Supporting services:
-  Secrets Manager  — API keys and DB credentials
+  Secrets Manager  — API key and DB credentials, never in code or env vars
   CloudWatch       — logs and failure alerts
+  GitHub Actions   — pytest runs on every push
 ```
 
 ---
+
+## Why this exists
+
+This started as a way to practice an end-to-end ETL build, but the design choices below are aimed at a specific, recurring data-engineering problem: **keeping a pipeline that depends on someone else's API honest when that API changes underneath you, rate-limits you, or just sends something slightly malformed.** That's the part that tends to matter more in practice than the happy path.
 
 ## AWS Services Used
 
 | Service | Role |
 |---------|------|
-| **Lambda** | Serverless compute for ingest and transform |
+| **Lambda** | Serverless compute for ingest, transform, and the quality check |
 | **S3** | Raw data storage (Bronze layer) |
 | **RDS PostgreSQL** | Structured storage for analytical queries |
-| **EventBridge** | Daily scheduled trigger |
-| **Secrets Manager** | Encrypted storage for credentials |
+| **EventBridge** | Daily scheduled trigger (cron) |
+| **Secrets Manager** | Encrypted storage for the API key and DB credentials |
 | **CloudWatch** | Log collection and failure alerting |
+| **GitHub Actions** | CI — runs the test suite on every push |
 
 ---
+
+## Reliability & data quality
+
+The things most likely to actually break a recurring third-party data pull, and how each is handled here:
+
+| Failure mode | Handling |
+|---|---|
+| Third-party API times out / connection drops | `urllib3.Retry` with exponential backoff (2s → 4s → 8s), only on the request itself |
+| API rate-limits the key | Alpha Vantage returns HTTP 200 with a `"Note"` field instead of an error — this is checked for explicitly (`ApiRateLimitError`) and logged separately from a real failure, so it's never confused with "the symbol doesn't exist" |
+| API silently renames or drops a field | `validate_price_data()` checks for every required field by name before touching it, so a schema change fails loudly with the missing field named, not a bare `KeyError` |
+| API returns technically-valid but nonsensical values | Sanity checks on top of schema checks: prices > 0, high ≥ low, volume ≥ 0 |
+| One bad record in a batch of five | Each record is validated and committed independently (`process_record`) — a bad file for one symbol is logged and skipped, the other four still load. The original version wrapped the whole batch in one transaction, so a single bad record rolled back everything |
+| Pipeline re-runs on the same day (retry, backfill) | `ON CONFLICT ... DO UPDATE` upsert — idempotent by design |
+| Silent degradation over time (a symbol quietly stops loading) | `data_quality_check.py` runs after the load and checks freshness (today's row exists per symbol), completeness (no symbol unexpectedly sparse over the last 7 days), and sanity (no bad values in the table itself) |
 
 ## Data Model
 
@@ -72,17 +104,30 @@ CREATE TABLE fact_stock_prices (
 ```
 
 Follows **Medallion Architecture**:
-- **Bronze layer**: raw JSON in S3, partitioned by date (`bronze/stock_prices/YYYY-MM-DD/`)
-- **Gold layer**: cleaned, structured data in RDS for SQL querying
+- **Bronze layer**: raw JSON in S3, partitioned by date (`bronze/stock_prices/YYYY-MM-DD/`), kept as-is so a transform bug can be fixed and replayed without re-calling the API
+- **Gold layer**: cleaned, validated, structured data in RDS for SQL querying
 
 ---
 
-## Setup
+## Testing
+
+Core logic (validation rules, the quality checks) is written as plain functions with no AWS dependency at the call site, so it's unit-tested without needing real AWS credentials or a live database:
+
+```bash
+pip install -r requirements.txt
+pytest -v
+```
+
+14 tests cover: schema-drift detection (missing/renamed fields), sanity-check edge cases (negative price, high < low, non-numeric values), and the three data-quality checks against a fake DB cursor. CI runs this on every push via GitHub Actions.
+
+---
+
+## Setup (to deploy for real)
 
 ### Prerequisites
 - AWS account with CLI configured
 - Python 3.12+
-- Alpha Vantage API key (free tier)
+- Alpha Vantage API key (free tier — 25 requests/day)
 
 ### Steps
 
@@ -102,7 +147,9 @@ Follows **Medallion Architecture**:
 
 7. **EventBridge** — create a cron rule (`cron(0 21 * * ? *)`) to invoke Lambda ① daily at 5PM ET.
 
-8. **CloudWatch** — create metric alarms on `Errors` for both Lambda functions, with SNS email notification on failure.
+8. **Lambda ③ (optional)** — deploy `data_quality_check.py` on its own EventBridge schedule shortly after Lambda ①/②, with a CloudWatch alarm on non-200 responses.
+
+9. **CloudWatch** — create metric alarms on `Errors` for all Lambda functions, with SNS email notification on failure.
 
 ---
 
@@ -119,6 +166,9 @@ Environment variables are visible in the Lambda console and can appear in logs. 
 
 **Why `ON CONFLICT` in the upsert query?**
 Ensures idempotency — running the pipeline multiple times on the same day won't create duplicate records.
+
+**Why validate at the transform step instead of trusting the API?**
+Free third-party APIs change without much notice. Checking the shape and sanity of the data on the way in means a schema change gets caught here, with a specific error message, instead of surfacing as a wrong number in a downstream report weeks later.
 
 ---
 
