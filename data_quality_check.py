@@ -21,11 +21,12 @@ from datetime import date, timedelta
 import boto3
 import psycopg2
 
+from symbols import TRACKED_SYMBOLS
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DB_SECRET_NAME = "stock-pipeline/db-credentials"
-TRACKED_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 
 
 def get_db_credentials():

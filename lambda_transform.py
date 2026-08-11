@@ -11,13 +11,11 @@ s3_client = boto3.client("s3")
 
 DB_SECRET_NAME = "stock-pipeline/db-credentials"
 
-# The fields Alpha Vantage is expected to return for each daily bar. Checked
+# The fields Twelve Data is expected to return for each daily bar. Checked
 # explicitly on every record so a silent upstream schema change (a renamed
 # or missing field) shows up as a clear log line instead of a raw KeyError
 # three functions away from where it actually happened.
-REQUIRED_PRICE_FIELDS = [
-    "1. open", "2. high", "3. low", "4. close", "5. volume",
-]
+REQUIRED_PRICE_FIELDS = ["open", "high", "low", "close", "volume"]
 
 
 def get_db_credentials():
@@ -44,10 +42,17 @@ def read_from_s3(bucket, key):
     return json.loads(response["Body"].read().decode("utf-8"))
 
 
-def get_latest_price(time_series):
-    """Pick the most recent trading day out of the time series payload."""
-    latest_date = sorted(time_series.keys())[-1]
-    return latest_date, time_series[latest_date]
+def get_latest_price(values):
+    """Pick the most recent trading day out of the "values" list.
+
+    lambda_function.py requests `order=desc`, so values[0] is already the
+    latest bar — but that's re-derived here with max() instead of trusted
+    blindly. If the fetch-time param ever changed (or a future caller built
+    this list a different way), reading the wrong day should fail loudly
+    against real data, not silently pass because index 0 used to be right.
+    """
+    latest = max(values, key=lambda v: v["datetime"])
+    return latest["datetime"], latest
 
 
 class DataQualityError(Exception):
@@ -59,7 +64,7 @@ def validate_price_data(symbol, price_date, price_data):
     """Schema and sanity checks run on every record before it's written.
 
     Two different failure modes are checked for on purpose:
-    - schema drift: a field Alpha Vantage used to send is missing or renamed
+    - schema drift: a field Twelve Data used to send is missing or renamed
     - bad values: fields are present but nonsensical (negative price,
       high below low), which a schema check alone would miss
     """
@@ -70,11 +75,11 @@ def validate_price_data(symbol, price_date, price_data):
         )
 
     try:
-        open_p = float(price_data["1. open"])
-        high_p = float(price_data["2. high"])
-        low_p = float(price_data["3. low"])
-        close_p = float(price_data["4. close"])
-        volume = int(price_data["5. volume"])
+        open_p = float(price_data["open"])
+        high_p = float(price_data["high"])
+        low_p = float(price_data["low"])
+        close_p = float(price_data["close"])
+        volume = int(float(price_data["volume"]))
     except (TypeError, ValueError) as e:
         raise DataQualityError(f"{symbol} {price_date}: non-numeric field value ({e})")
 
@@ -125,11 +130,10 @@ def process_record(cursor, bucket, key):
     symbol = key.split("/")[-1].replace(".json", "")
     raw_data = read_from_s3(bucket, key)
 
-    if "Time Series (Daily)" not in raw_data:
-        raise DataQualityError(f"{symbol}: no 'Time Series (Daily)' key in raw payload")
+    if not raw_data.get("values"):
+        raise DataQualityError(f"{symbol}: no 'values' array in raw payload")
 
-    time_series = raw_data["Time Series (Daily)"]
-    price_date, price_data = get_latest_price(time_series)
+    price_date, price_data = get_latest_price(raw_data["values"])
     clean = validate_price_data(symbol, price_date, price_data)
     upsert_stock_price(cursor, symbol, price_date, clean)
     return f"{symbol} - {price_date}"
